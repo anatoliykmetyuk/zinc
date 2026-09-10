@@ -145,3 +145,13 @@ and sbt will put a copyright notice into it.
 
 Contributing to Zinc requires you or your employer to sign the
 [Lightbend Contributor License Agreement](https://www.lightbend.com/contribute/cla).
+
+### Ordered pipelining regression tests
+
+The ordered pipelining tests compile a downstream project from the upstream early API while the upstream Scala classfile is still absent. They cover both compile orders and directory and JAR output. Scala 3.3 lacks the required compiler flags, so its overlap cases are explicitly canceled by the ordinary suite. Run the supported Scala 3.8.4 cases together with Scala 2.12 and 2.13 using:
+
+```bash
+sbt 'set compilerBridgeScala3Bin / scalaVersion := "3.8.4"' \
+  'set compilerBridgeScala3Bin / libraryDependencies := Seq("org.scala-lang" % "scala3-sbt-bridge" % "3.8.4")' \
+  'zinc3/testOnly sbt.inc.OrderedPipeliningSpec'
+```

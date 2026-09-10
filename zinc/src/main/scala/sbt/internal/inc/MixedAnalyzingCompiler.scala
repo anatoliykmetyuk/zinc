@@ -143,6 +143,8 @@ final class MixedAnalyzingCompiler(
     val incSrc = config.sources.filter(include)
     val (javaSrcs, scalaSrcs) = incSrc.partition(MixedAnalyzingCompiler.javaOnly)
     logInputs(log, javaSrcs.size, scalaSrcs.size, outputDirs)
+    val javaFirst = config.currentSetup.order == JavaThenScala &&
+      config.sources.exists(s => !MixedAnalyzingCompiler.javaOnly(s))
     val pickleJava =
       Incremental.isPickleJava(config.currentSetup.options.scalacOptions.toIndexedSeq)
 
@@ -154,7 +156,60 @@ final class MixedAnalyzingCompiler(
         case _ => value
       }
 
-    // Compile Scala sources.
+    def earlyCallback(prepare: () => Unit): XAnalysisCallback = {
+      val delegate = callback
+      MixedAnalyzingCompiler.preserveCallbackVersion(
+        callback,
+        new XAnalysisCallback {
+          export delegate.{ apiPhaseCompleted => _, dependencyPhaseCompleted => _, _ }
+          private lazy val prepared = prepare()
+          override def apiPhaseCompleted(): Unit = {
+            prepared
+            delegate.apiPhaseCompleted()
+          }
+          override def dependencyPhaseCompleted(): Unit = {
+            prepared
+            delegate.dependencyPhaseCompleted()
+          }
+        }
+      )
+    }
+    val javaProducts = java.util.concurrent.ConcurrentHashMap.newKeySet[Path]()
+    val recordingJavaCallback = MixedAnalyzingCompiler.preserveCallbackVersion(
+      callback,
+      new XAnalysisCallback {
+        export callback.{ generatedNonLocalClass => _, generatedLocalClass => _, _ }
+        override def generatedNonLocalClass(
+            source: VirtualFileRef,
+            product: Path,
+            binaryName: String,
+            sourceName: String
+        ): Unit = {
+          javaProducts.add(product)
+          callback.generatedNonLocalClass(source, product, binaryName, sourceName)
+        }
+        @scala.annotation.nowarn("cat=deprecation")
+        override def generatedNonLocalClass(
+            source: File,
+            product: File,
+            binaryName: String,
+            sourceName: String
+        ): Unit = {
+          javaProducts.add(product.toPath)
+          callback.generatedNonLocalClass(source, product, binaryName, sourceName)
+        }
+        override def generatedLocalClass(source: VirtualFileRef, product: Path): Unit = {
+          javaProducts.add(product)
+          callback.generatedLocalClass(source, product)
+        }
+        @scala.annotation.nowarn("cat=deprecation")
+        override def generatedLocalClass(source: File, product: File): Unit = {
+          javaProducts.add(product.toPath)
+          callback.generatedLocalClass(source, product)
+        }
+      }
+    )
+
     def compileScala(): Unit =
       if (scalaSrcs.nonEmpty || pickleJava) {
         val pickleJarPair = callback.getPickleJarPair.toOption.map(t2 => (t2.get1, t2.get2))
@@ -179,7 +234,7 @@ final class MixedAnalyzingCompiler(
         }
         JarUtils.withPreviousJar(output) { (extraClasspath: Seq[Path]) =>
           val sources =
-            if (config.currentSetup.order == Mixed) incSrc
+            if (config.currentSetup.order == Mixed || (!javaFirst && scalaSrcs.isEmpty)) incSrc
             else scalaSrcs
 
           val cp0: Vector[VirtualFile] =
@@ -196,15 +251,101 @@ final class MixedAnalyzingCompiler(
               }
               (cp0 ++ libraryJars).distinct
             } else cp0
+          def prepareJavaApi(): Unit = {
+            if (
+              javaSrcs.nonEmpty && (javaFirst ||
+                config.currentSetup.order == ScalaThenJava && scalaSrcs.nonEmpty)
+            ) {
+              pickleJarPair.foreach { case (originalJar, updatesJar) =>
+                if (javaFirst) {
+                  import scala.jdk.CollectionConverters._
+                  val products = javaProducts.asScala
+                  val sourceJar = JarUtils.getOutputJar(output)
+                    .map(jar =>
+                      RootPath(extraClasspath.headOption.getOrElse(jar), writable = false)
+                    )
+                  val target = RootPath(updatesJar, writable = false)
+                  try {
+                    products.foreach { product =>
+                      val relative = sourceJar match {
+                        case Some(_) =>
+                          new JarUtils.ClassInJar(product.toString).toClassFilePathOrNull
+                        case None => output.getSingleOutputAsPath.get()
+                            .relativize(product).toString
+                      }
+                      val source = sourceJar match {
+                        case Some(root) => root.root.resolve(relative)
+                        case None       => product
+                      }
+                      val destination = target.root.resolve(relative.replace('\\', '/'))
+                      Files.createDirectories(destination.getParent)
+                      Files.copy(
+                        source,
+                        destination,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING
+                      )
+                    }
+                  } finally {
+                    target.close()
+                    sourceJar.foreach(_.close())
+                  }
+                } else {
+                  val javaJar = Files.createTempFile(updatesJar.getParent, "java-api-", ".jar")
+                  Files.delete(javaJar)
+                  PickleJar.touch(javaJar)
+                  val javaCallback = MixedAnalyzingCompiler.preserveCallbackVersion(
+                    callback,
+                    new XAnalysisCallback {
+                      export callback.{ apiPhaseCompleted => _, dependencyPhaseCompleted => _, _ }
+                      override def apiPhaseCompleted(): Unit = ()
+                      override def dependencyPhaseCompleted(): Unit = ()
+                    }
+                  )
+                  val javaOpts = scalacOpts.map {
+                    case x if x == updatesJar.toString => javaJar.toString
+                    case x                             => x
+                  }
+                  val javaCp = Vector(updatesJar, originalJar)
+                    .filter(Files.exists(_))
+                    .map(config.converter.toVirtualFile) ++ cp
+                  try {
+                    config.compiler.compile(
+                      javaSrcs.toArray,
+                      javaCp.toArray,
+                      config.converter,
+                      changes,
+                      javaOpts.toArray,
+                      output,
+                      javaCallback,
+                      config.reporter,
+                      config.progress.toOptional,
+                      log
+                    )
+                    IndexBasedZipFsOps.mergeArchives(updatesJar, javaJar)
+                  } finally Files.deleteIfExists(javaJar)
+                }
+              }
+            }
+          }
+          val scalaCallback =
+            if (
+              pickleJarPair.nonEmpty && (javaFirst ||
+                config.currentSetup.order == ScalaThenJava && scalaSrcs.nonEmpty)
+            )
+              earlyCallback(() => prepareJavaApi())
+            else callback
           timed("Scala compilation", log) {
-            config.compiler.compile(
+            if (javaFirst && scalaSrcs.isEmpty) {
+              scalaCallback.apiPhaseCompleted()
+              scalaCallback.dependencyPhaseCompleted()
+            } else config.compiler.compile(
               sources.toArray,
               cp.toArray,
               config.converter,
               changes,
               scalacOpts.toArray,
               output,
-              callback,
+              scalaCallback,
               config.reporter,
               config.progress.toOptional,
               log
@@ -212,9 +353,16 @@ final class MixedAnalyzingCompiler(
           }
         }
       }
-    def compileJava0(): Unit = compileJava(javaSrcs, callback, classfileManager)
+    def compileJava0(): Unit = {
+      compileJava(javaSrcs, recordingJavaCallback, classfileManager)
+      import scala.jdk.CollectionConverters._
+      classfileManager.generated(
+        javaProducts.asScala.iterator.map(config.converter.toVirtualFile).toArray
+      )
+    }
 
     if (config.incOptions.pipelining) {
+      if (javaFirst) compileJava0()
       compileScala()
       if (scalaSrcs.nonEmpty) {
         log.debug("done compiling Scala sources")
@@ -293,6 +441,20 @@ final class MixedAnalyzingCompiler(
  * of cross Java-Scala compilation.
  */
 object MixedAnalyzingCompiler {
+  private def preserveCallbackVersion(
+      original: XAnalysisCallback,
+      wrapped: XAnalysisCallback
+  ): XAnalysisCallback = original match {
+    case callback: xsbti.AnalysisCallback3 => new xsbti.AnalysisCallback3 {
+        export wrapped._
+        export callback.{ problem2, toVirtualFile, getSourceInfos }
+      }
+    case callback: xsbti.AnalysisCallback2 => new xsbti.AnalysisCallback2 {
+        export wrapped._
+        export callback.problem2
+      }
+    case _ => wrapped
+  }
 
   /** Returns true if the file is java. */
   private[sbt] def javaOnly(f: VirtualFileRef): Boolean = f.id.endsWith(".java")

@@ -106,6 +106,38 @@ object Incremental {
       nextInvalidations: Set[String],
       analysis: Analysis
   )
+  private[inc] def knownProducts(
+      merged: Analysis,
+      output: Output,
+      converter: FileConverter
+  ): java.util.Set[String] = {
+    // List classes defined in the files that were compiled in this run.
+    val ps: java.util.Set[String] = new java.util.HashSet[String]()
+    val knownProducts: collection.Set[VirtualFileRef] = merged.relations.allProducts
+
+    // extract product paths
+    val so =
+      jo2o(output.getSingleOutputAsPath).getOrElse(sys.error(s"unsupported output $output"))
+    val isJarOutput = so.getFileName.toString.endsWith(".jar")
+    knownProducts foreach { product =>
+      if (isJarOutput) {
+        new JarUtils.ClassInJar(product.id).toClassFilePathOrNull match {
+          case null =>
+          case path =>
+            ps.add(path.replace('\\', '/'))
+        }
+      } else {
+        val productPath = converter.toPath(product)
+        try {
+          ps.add(so.relativize(productPath).toString.replace('\\', '/'))
+        } catch {
+          case NonFatal(_) => ps.add(product.id)
+        }
+      }
+    }
+    ps
+  }
+
   object CompileCycleResult {
     def apply(
         continue: Boolean,
@@ -171,41 +203,43 @@ object Incremental {
     val runProfiler = new AdaptedRunProfiler(profiler.profileRun)
     val incremental: IncrementalCommon = new IncrementalNameHashing(log, options, runProfiler)
     try {
-      incrementalCompile(
-        sources,
-        converter,
-        lookup,
-        previous,
-        currentStamper,
-        (vs, depCh, cb, cfm) => {
-          val startTime = System.nanoTime()
-          compile(vs, depCh, cb, cfm)
-          runProfiler.timeCompilation(startTime, System.nanoTime() - startTime)
-        },
-        new AnalysisCallback.Builder(
-          lookup.lookupAnalyzedClass(_, _),
-          currentStamper,
-          options,
-          currentSetup,
+      withEarlyArtifacts(earlyJar, earlyAnalysisStore, currentSetup) {
+        incrementalCompile(
+          sources,
           converter,
           lookup,
+          previous,
+          currentStamper,
+          (vs, depCh, cb, cfm) => {
+            val startTime = System.nanoTime()
+            compile(vs, depCh, cb, cfm)
+            runProfiler.timeCompilation(startTime, System.nanoTime() - startTime)
+          },
+          new AnalysisCallback.Builder(
+            lookup.lookupAnalyzedClass(_, _),
+            currentStamper,
+            options,
+            currentSetup,
+            converter,
+            lookup,
+            output,
+            outputJarContent,
+            earlyOutput,
+            earlyAnalysisStore,
+            pickleJarPair,
+            progress,
+            log
+          ),
+          incremental,
+          options,
+          currentSetup,
           output,
           outputJarContent,
           earlyOutput,
-          earlyAnalysisStore,
-          pickleJarPair,
           progress,
           log
-        ),
-        incremental,
-        options,
-        currentSetup,
-        output,
-        outputJarContent,
-        earlyOutput,
-        progress,
-        log
-      )(using Equiv.universal)
+        )(using Equiv.universal)
+      }
     } catch {
       case _: xsbti.CompileCancelled =>
         log.info("Compilation has been cancelled")
@@ -213,6 +247,54 @@ object Incremental {
         // and we can report back as there was no change (false) and return a previous Analysis which is still up-to-date
         (false, previous)
     } finally runProfiler.registerRun()
+  }
+
+  private def withEarlyArtifacts[A](
+      earlyJar: Option[Path],
+      earlyAnalysisStore: Option[XAnalysisStore],
+      setup: MiniSetup
+  )(run: => A): A = if (earlyJar.isEmpty) run
+  else {
+    val previousAnalysis = earlyAnalysisStore.flatMap(store => jo2o(store.get()))
+    val backup = earlyJar.filter(Files.exists(_)).map { jar =>
+      val saved = Files.createTempFile(jar.getParent, ".early-backup-", ".jar")
+      try Files.copy(jar, saved, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+      catch {
+        case error: Throwable =>
+          try Files.deleteIfExists(saved)
+          catch { case cleanup: Throwable => error.addSuppressed(cleanup) }
+          throw error
+      }
+      jar -> saved
+    }
+    var failure: Option[Throwable] = None
+    try run
+    catch {
+      case error: Throwable =>
+        failure = Some(error)
+        try {
+          backup match {
+            case Some((jar, saved)) =>
+              Files.copy(saved, jar, java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            case None => earlyJar.foreach(Files.deleteIfExists(_))
+          }
+        } catch { case rollback: Throwable => error.addSuppressed(rollback) }
+        try earlyAnalysisStore.foreach(_.set(previousAnalysis.getOrElse(
+            AnalysisContents.create(Analysis.empty, setup)
+          )))
+        catch { case rollback: Throwable => error.addSuppressed(rollback) }
+        throw error
+    } finally {
+      backup.foreach { case (_, saved) =>
+        try Files.deleteIfExists(saved)
+        catch {
+          case cleanup: Throwable => failure match {
+              case Some(error) => error.addSuppressed(cleanup)
+              case None        => throw cleanup
+            }
+        }
+      }
+    }
   }
 
   def extractEarlyJar(earlyOutput: Option[Output]): Option[Path] =
@@ -276,7 +358,16 @@ object Incremental {
             val products = partialAnalysis.relations.allProducts
               .map(converter.toVirtualFile(_))
             classFileManager.generated(products.toArray)
-            a1
+            JarUtils.getOutputJar(output) match {
+              case Some(jar) =>
+                val stamps = a1.stamps.allProducts.foldLeft(a1.stamps) { (acc, product) =>
+                  if (JarUtils.getJarInClassInJar(converter.toPath(product)).contains(jar))
+                    acc.markProduct(product, currentStamper.product(product))
+                  else acc
+                }
+                a1.copy(stamps = stamps)
+              case None => a1
+            }
           }
           compileJava(sources, callback, classFileManager)
           val a0 = callback.getPostJavaAnalysis
@@ -426,7 +517,14 @@ object Incremental {
               )
             else previous
           if (earlyOutput.isDefined)
-            writeEarlyOut(lookup, progress, earlyOutput, analysis, new java.util.HashSet, log)
+            writeEarlyOut(
+              lookup,
+              progress,
+              earlyOutput,
+              analysis,
+              knownProducts(analysis, output, converter),
+              log
+            )
           analysis
         }
     }
@@ -1195,7 +1293,14 @@ private final class AnalysisCallback(
     earlyAnalysisStore.foreach(_.set(AnalysisContents.create(trimmedAnalysis, trimmedSetup)))
 
     mergeUpdates() // must merge updates each cycle or else scalac will clobber it
-    Incremental.writeEarlyOut(lookup, progress, earlyOutput, merged, knownProducts(merged), log)
+    Incremental.writeEarlyOut(
+      lookup,
+      progress,
+      earlyOutput,
+      merged,
+      Incremental.knownProducts(merged, output, converter),
+      log
+    )
   }
 
   private def mergeUpdates() = {
@@ -1211,30 +1316,4 @@ private final class AnalysisCallback(
     }
   }
 
-  private def knownProducts(merged: Analysis) = {
-    // List classes defined in the files that were compiled in this run.
-    val ps: java.util.Set[String] = new java.util.HashSet[String]()
-    val knownProducts: collection.Set[VirtualFileRef] = merged.relations.allProducts
-
-    // extract product paths
-    val so = jo2o(output.getSingleOutputAsPath).getOrElse(sys.error(s"unsupported output $output"))
-    val isJarOutput = so.getFileName.toString.endsWith(".jar")
-    knownProducts foreach { product =>
-      if (isJarOutput) {
-        new JarUtils.ClassInJar(product.id).toClassFilePathOrNull match {
-          case null =>
-          case path =>
-            ps.add(path.replace('\\', '/'))
-        }
-      } else {
-        val productPath = converter.toPath(product)
-        try {
-          ps.add(so.relativize(productPath).toString.replace('\\', '/'))
-        } catch {
-          case NonFatal(_) => ps.add(product.id)
-        }
-      }
-    }
-    ps
-  }
 }

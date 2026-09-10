@@ -29,11 +29,9 @@ object PickleJar {
 
   def write(pickleOut: Path, knownProducts: java.util.Set[String], log: Logger): Unit = {
     touch(pickleOut)
-    if (!knownProducts.isEmpty) {
-      val pj = RootPath(pickleOut, writable = false) // so it doesn't delete the file
-      try Files.walkFileTree(pj.root, deleteUnknowns(knownProducts, log))
-      finally Retry(pj.close())
-    }
+    val pj = RootPath(pickleOut, writable = false) // so it doesn't delete the file
+    try Files.walkFileTree(pj.root, deleteUnknowns(knownProducts, log))
+    finally Retry(pj.close())
     ()
   }
 
@@ -41,12 +39,14 @@ object PickleJar {
     new SimpleFileVisitor[Path] {
       override def visitFile(path: Path, attrs: BasicFileAttributes): FileVisitResult = {
         val ps = path.toString
-        if (ps.endsWith(".sig")) {
-          // "/foo/bar/wiz.sig" -> "foo/bar/wiz.class"
-          if (!knownProducts.contains(ps.stripPrefix("/").stripSuffix(".sig") + ".class")) {
+        val stem = List(".sig", ".tasty", ".class").find(ps.endsWith).map(ps.stripSuffix)
+        stem.foreach { name =>
+          val relative = name.stripPrefix("/")
+          if (
+            !knownProducts.contains(relative + ".class") &&
+            !(ps.endsWith(".tasty") && knownProducts.contains(relative + "$.class"))
+          ) {
             log.debug(s"PickleJar.deleteUnknowns: visitFile deleting $ps")
-            // retry to work around C:\Users\RUNNER~1\AppData\Local\Temp\sbt_f3e67bfa\dep\target\early\output.jar:
-            // The process cannot access the file because it is being used by another process.
             Retry(Files.delete(path))
           }
         }
